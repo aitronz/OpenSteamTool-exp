@@ -6,9 +6,11 @@ body:
   - type: markdown
     attributes:
       value: |
+        Only report an issue if it is related to how the merge was made in this repository.
+        If the issue is with the pull request itself, please go to the original repository's pull request and comment there.
+
         Thanks for taking the time to file a bug report! Please fill in the fields below so we can reproduce and fix the issue quickly.
 
-        - For issues with a **specific game** (Denuvo / SteamStub / unlock not working), please use the **Game Compatibility** template instead.
         - Make sure you are running the latest build before reporting.
 
   - type: checkboxes
@@ -19,6 +21,8 @@ body:
         - label: I have searched existing issues and confirmed this has not been reported.
           required: true
         - label: I am using the latest build version from the releases page.
+          required: true
+        - label: This issue is related to how the pull request was merged and/or to conflicts with other pull requests.
           required: true
 
   - type: input
