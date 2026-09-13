@@ -9,32 +9,119 @@
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Thread.h"
 
+#include <chrono>
+#include <thread>
 #include <windows.h>
 
 // Prepare key runtime paths.
-// Portable: paths are resolved relative to the DLL's own directory rather than
-// the process current directory, so the tool works regardless of install location.
+// Steam root defaults to the process current directory (Steam install dir);
+// DllDir tracks this module's own directory for portable lookups.
+// If steamclient64.dll is missing in the CWD but present next to the DLL,
+// fall back to the DLL directory (portable install).
 bool InitializeSteamComponents(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
 {
-    const auto dllDir = OSTPlatform::DynamicLibrary::GetModuleDirectory(selfModule);
-    const std::string basePath = dllDir.string();
-    if (basePath.empty()) {
+    std::string steamInstallPath = OSTPlatform::DynamicLibrary::GetCurrentDirectoryPath();
+    const auto dllDirFs = OSTPlatform::DynamicLibrary::GetModuleDirectory(selfModule);
+    std::string dllPath = dllDirFs.string();
+    if (dllPath.empty()) {
+        dllPath = steamInstallPath;
+    }
+    if (steamInstallPath.empty()) {
+        steamInstallPath = dllPath;
+    }
+    if (steamInstallPath.empty()) {
         return false;
     }
-    sprintf_s(SteamInstallPath, kRuntimePathCapacity, "%s", basePath.c_str());
-    sprintf_s(SteamclientPath, kRuntimePathCapacity, "%s\\steamclient64.dll",  SteamInstallPath);
-    sprintf_s(SteamUIPath,     kRuntimePathCapacity, "%s\\steamui.dll",        SteamInstallPath);
-    sprintf_s(DiversionPath,   kRuntimePathCapacity, "%s\\bin\\diversion.dll", SteamInstallPath);
+    {
+        std::error_code ec;
+        const bool inCwd = std::filesystem::exists(
+            std::filesystem::path(steamInstallPath) / "steamclient64.dll", ec);
+        ec.clear();
+        const bool inDllDir = std::filesystem::exists(
+            std::filesystem::path(dllPath) / "steamclient64.dll", ec);
+        if (!inCwd && inDllDir) {
+            steamInstallPath = dllPath;
+        }
+    }
+    sprintf_s(SteamInstallPath, kRuntimePathCapacity, "%s", steamInstallPath.c_str());
+    sprintf_s(SteamclientPath, kRuntimePathCapacity, "%s\\steamclient64.dll",    SteamInstallPath);
+    sprintf_s(SteamUIPath,     kRuntimePathCapacity, "%s\\steamui.dll",          SteamInstallPath);
+    sprintf_s(DiversionPath,   kRuntimePathCapacity, "%s\\bin\\diversion64.dll", SteamInstallPath);
     sprintf_s(LuaDir,          kRuntimePathCapacity, "%s\\config\\lua",        SteamInstallPath);
     sprintf_s(ConfigPath,      kRuntimePathCapacity, "%s\\opensteamtool.toml", SteamInstallPath);
-    
-    client_hModule = OSTPlatform::DynamicLibrary::Load(SteamclientPath);
-    if (!client_hModule) {
-        LOG_ERROR("Load steamclient64.dll failed: {} (err={})",
-                  SteamclientPath, OSTPlatform::DynamicLibrary::GetLastErrorCode());
-        return false;
+
+    sprintf_s(DllDir, kRuntimePathCapacity, "%s", dllPath.c_str());
+
+    // Diversion shadow module cloning & loading:
+    // Clone steamclient64.dll into bin\diversion64.dll so all hooks and patches
+    // are isolated to the diversion module while original steamclient64.dll stays 100% clean.
+    WIN32_FILE_ATTRIBUTE_DATA origAttr{}, divAttr{};
+    const bool origExists = GetFileAttributesExA(SteamclientPath, GetFileExInfoStandard, &origAttr) != 0;
+    const bool divExists  = GetFileAttributesExA(DiversionPath, GetFileExInfoStandard, &divAttr) != 0;
+
+    bool isUpToDate = false;
+    if (origExists && divExists) {
+        if (origAttr.nFileSizeHigh == divAttr.nFileSizeHigh &&
+            origAttr.nFileSizeLow  == divAttr.nFileSizeLow &&
+            origAttr.ftLastWriteTime.dwLowDateTime  == divAttr.ftLastWriteTime.dwLowDateTime &&
+            origAttr.ftLastWriteTime.dwHighDateTime == divAttr.ftLastWriteTime.dwHighDateTime)
+        {
+            isUpToDate = true;
+        }
     }
-    LOG_INFO("Loaded steamclient64.dll from {}", SteamclientPath);
+
+    bool copyOk = isUpToDate;
+    if (isUpToDate) {
+        LOG_DEBUG("Diversion module is already up to date ({}), skipping copy", DiversionPath);
+    } else {
+        std::filesystem::path diversionFsPath(DiversionPath);
+        std::error_code ec;
+        std::filesystem::create_directories(diversionFsPath.parent_path(), ec);
+        if (divExists && (divAttr.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesA(DiversionPath, FILE_ATTRIBUTE_NORMAL);
+        }
+
+        // Retry up to 3 times in case the old Steam process is still releasing the file handle
+        constexpr int kMaxCopyRetries = 3;
+        [[maybe_unused]] DWORD gle = ERROR_SUCCESS;
+        for (int attempt = 1; attempt <= kMaxCopyRetries; ++attempt) {
+            if (CopyFileA(SteamclientPath, DiversionPath, FALSE)) {
+                copyOk = true;
+                LOG_INFO("Cloned steamclient64.dll -> {}", DiversionPath);
+                break;
+            }
+            gle = GetLastError();
+            if (attempt < kMaxCopyRetries && (gle == ERROR_SHARING_VIOLATION || gle == ERROR_ACCESS_DENIED)) {
+                Sleep(50);
+            }
+        }
+
+        if (!copyOk) {
+            LOG_WARN("CopyFileA to diversion64.dll failed after {} attempts (err={})", kMaxCopyRetries, gle);
+        }
+    }
+
+    if (copyOk) {
+        client_hModule = OSTPlatform::DynamicLibrary::Load(DiversionPath);
+        if (client_hModule) {
+            g_IsDiversionActive.store(true);
+            LOG_INFO("Loaded diversion module from {}", DiversionPath);
+        } else {
+            LOG_WARN("Load diversion module failed (path={}, err={}), falling back to real steamclient64.dll",
+                     DiversionPath, OSTPlatform::DynamicLibrary::GetLastErrorCode());
+        }
+    }
+
+    if (!client_hModule) {
+        g_IsDiversionActive.store(false);
+        client_hModule = OSTPlatform::DynamicLibrary::Load(SteamclientPath);
+        if (!client_hModule) {
+            LOG_ERROR("Load steamclient64.dll failed: {} (err={})",
+                      SteamclientPath, OSTPlatform::DynamicLibrary::GetLastErrorCode());
+            return false;
+        }
+        LOG_INFO("Loaded fallback steamclient64.dll from {} (Diversion inactive)", SteamclientPath);
+    }
     
     ui_hModule = OSTPlatform::DynamicLibrary::Load(SteamUIPath);
     if(!ui_hModule) {
@@ -68,6 +155,10 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     PatternLoader::Load(ui_hModule, SteamUIPath, "steamui");
     PatternLoader::Load(client_hModule, SteamclientPath, "steamclient");
 
+    // Install SteamUI hooks early so LoadModuleWithPath can intercept
+    // and synchronize with client hook installation.
+    SteamUI::CoreHook();
+
     // IPC method metadata (funcHash, fencepost, argc, ...)
     IPCLoader::Load(SteamclientPath);
 
@@ -79,7 +170,6 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     LuaFileWatcher::Start(watchDirs);
     ConfigFileWatcher::Start(ConfigPath, LuaDir);
 
-    SteamUI::CoreHook();
     SteamClient::CoreHook();
 
     // Surface any functions that FindPattern() could not locate.
@@ -89,7 +179,9 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     // [cloud].enabled is set and cloud_redirect.dll is present.
     CloudRedirectHost::Initialize(SteamInstallPath);
 
-    LOG_INFO("OpenSteamTool init complete");
+    g_HooksInstalled.store(true);
+    LOG_INFO("OpenSteamTool init complete ({})",
+             g_IsDiversionActive.load() ? "Diversion active" : "Diversion bypassed, using original steamclient64");
     return 0;
 }
 
@@ -114,6 +206,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
     }
     else if (dwReason == DLL_PROCESS_DETACH)
     {
+        g_HooksInstalled.store(false);
+        g_IsDiversionActive.store(false);
         // During process termination, only stop watchers to avoid loader-lock
         // work in CoreUnhook (which may call LoadLibrary/FreeLibrary).
         if (pvReserved != nullptr) {
